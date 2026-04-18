@@ -1,0 +1,11 @@
+# Cargo
+/target
+**/*.rs.bk
+*.pdb
+
+# 本地环境变量（API 密钥等）
+.env
+.env.*
+
+# macOS
+.DS_Store
