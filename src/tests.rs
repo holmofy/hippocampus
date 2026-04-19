@@ -2,6 +2,7 @@ use async_trait::async_trait;
 
 use crate::llm::LlmProvider;
 use crate::policy::{PromptContext, ToolProfile};
+use crate::react::parser::parse_thought;
 use crate::react::{ReactConfig, ReactLoop};
 use crate::tools::{assemble_tools, EchoTool, NetworkEchoTool};
 
@@ -22,7 +23,14 @@ impl LlmProvider for std::sync::Mutex<StubLlm> {
 
 #[tokio::test]
 async fn stops_on_final_answer_without_tools() {
-    let loop_ = ReactLoop::new("You are a test agent.", vec![], ReactConfig { max_steps: 4 });
+    let loop_ = ReactLoop::new(
+        "You are a test agent.",
+        vec![],
+        ReactConfig {
+            max_steps: 4,
+            ..Default::default()
+        },
+    );
     let llm = std::sync::Mutex::new(StubLlm {
         outputs: vec!["Thought: done\nFinal Answer: 42\n"],
         i: 0,
@@ -36,7 +44,10 @@ async fn one_tool_then_final() {
     let loop_ = ReactLoop::new(
         "You are a test agent.",
         vec![Box::new(EchoTool)],
-        ReactConfig { max_steps: 4 },
+        ReactConfig {
+            max_steps: 4,
+            ..Default::default()
+        },
     );
     let llm = std::sync::Mutex::new(StubLlm {
         outputs: vec![
@@ -54,7 +65,10 @@ async fn network_tool_is_denied_without_capability() {
     let loop_ = ReactLoop::new(
         "You are a test agent.",
         vec![Box::new(NetworkEchoTool)],
-        ReactConfig { max_steps: 4 },
+        ReactConfig {
+            max_steps: 4,
+            ..Default::default()
+        },
     );
     let llm = std::sync::Mutex::new(StubLlm {
         outputs: vec![
@@ -79,7 +93,10 @@ async fn lsp_tool_is_denied_without_capability() {
     let loop_ = ReactLoop::new(
         "You are a test agent.",
         tools,
-        ReactConfig { max_steps: 4 },
+        ReactConfig {
+            max_steps: 4,
+            ..Default::default()
+        },
     );
     let llm = std::sync::Mutex::new(StubLlm {
         outputs: vec![
@@ -111,7 +128,10 @@ fn workspace_agents_md_is_injected_when_present() {
     let loop_ = ReactLoop::new(
         "SYS",
         assemble_tools(&ctx).unwrap(),
-        ReactConfig { max_steps: 3 },
+        ReactConfig {
+            max_steps: 3,
+            ..Default::default()
+        },
     );
     let rendered = loop_.render_prompt(&ctx, "TASK", "");
     assert!(rendered.contains("hello from agents"));
@@ -124,7 +144,14 @@ fn harness_shows_tool_profile_and_allowlist() {
     let mut ctx = PromptContext::default();
     ctx.set_tool_profile(ToolProfile::Office).unwrap();
     let tools = assemble_tools(&ctx).unwrap();
-    let loop_ = ReactLoop::new("SYS", tools, ReactConfig { max_steps: 3 });
+    let loop_ = ReactLoop::new(
+        "SYS",
+        tools,
+        ReactConfig {
+            max_steps: 3,
+            ..Default::default()
+        },
+    );
     let rendered = loop_.render_prompt(&ctx, "TASK", "");
     assert!(rendered.contains("tool_profile: office"));
     assert!(rendered.contains(
@@ -152,6 +179,14 @@ fn read_file_respects_line_window() {
     assert_eq!(lines.len(), 2);
     assert_eq!(lines[0].as_str().unwrap(), "L2");
     assert_eq!(lines[1].as_str().unwrap(), "L3");
+}
+
+#[test]
+fn parse_thought_stops_before_action_or_final() {
+    let block = "Thought: a\nb\nAction: echo\nAction Input: \"x\"\n";
+    assert_eq!(parse_thought(block).as_deref(), Some("a\nb"));
+    let fin = "Thought: done\nFinal Answer: 99\n";
+    assert_eq!(parse_thought(fin).as_deref(), Some("done"));
 }
 
 #[test]

@@ -1,7 +1,9 @@
 //! 演示：
 //! - 默认用 OpenAI-compatible provider（OpenAI / OpenRouter / 自建兼容网关）
-//! - 若未配置环境变量，则 fallback 到「脚本 LLM」跑通循环
+//! - 若未配置环境变量，则 fallback 到「脚本 LLM」跑通循环（演示 `list_dir`，非 echo）
 //! - 启动时从**当前工作目录**读取 `.env` 并注入进程环境（文件不存在则忽略；**不覆盖**已在 shell 里设置的同名变量）
+//! - **无位置参数**时进入交互会话：每行输入一个任务目标；**直接回车**退出
+//! - 推理链（Thought / Action / Observation）通过 `ReactConfig::trace_thinking` 打到 **stderr**，与最终答案（stdout）分离
 //!
 //! 环境变量（OpenAI-compatible）：
 //! - CODEX_BASE_URL: 例如 "https://api.openai.com"
@@ -20,12 +22,21 @@
 //! - `--print-system-prompt`：打印第一轮完整 prompt（不调用模型）
 //! - `--workspace <path>` / `--run-id <id>`：覆盖对应字段
 //! - `--profile <coding|office|full|minimal|custom>`：覆盖 `HIPPOCAMPUS_TOOL_PROFILE`（`custom` 仍需环境变量 `HIPPOCAMPUS_TOOL_ALLOWLIST`）
+//! - 位置参数 `TASK...`：非交互，单轮执行后退出
 
 use hippocampus::{
     assemble_tools, LlmProvider, OpenAiCompatibleProvider, PromptContext, ReactConfig, ReactLoop,
-    ToolProfile,
+    ReactError, ToolProfile,
 };
+use std::io::{BufRead, Write};
 use std::path::PathBuf;
+
+/// 面向工作区与工具的通用系统提示（具体格式约束见静态 prompt 模板）。
+const AGENT_SYSTEM: &str = r#"You are Hippocampus, a general-purpose autonomous agent operating inside a bounded workspace harness.
+- Clarify ambiguities when needed, but prefer acting with tools over guessing when facts are cheap to obtain.
+- Use read_file / list_dir / glob_search / grep_search / lsp (when allowed) to inspect the codebase; use echo only for trivial checks.
+- Respect capability flags: do not attempt network or shell tools unless the harness enables them.
+- Every model turn MUST follow the required scratchpad format: Thought, then either Action+Action Input or Final Answer."#;
 
 /// 按顺序返回预设回复，用于本地跑通循环。
 struct ScriptedLlm {
@@ -48,6 +59,11 @@ impl ScriptedProvider {
     fn new(lines: impl IntoIterator<Item: Into<String>>) -> Self {
         Self(tokio::sync::Mutex::new(ScriptedLlm::new(lines)))
     }
+
+    /// 交互模式下每轮任务前重置，否则会立刻耗尽脚本。
+    async fn rewind(&self) {
+        self.0.lock().await.next = 0;
+    }
 }
 
 #[async_trait::async_trait]
@@ -56,15 +72,14 @@ impl LlmProvider for ScriptedProvider {
         let mut guard = self.0.lock().await;
         let idx = guard.next;
         guard.next += 1;
-        let out = guard
-            .lines
-            .get(idx)
-            .cloned()
-            .unwrap_or_else(|| "Thought: stuck\nFinal Answer: (no more scripted replies)\n".into());
+        let out = guard.lines.get(idx).cloned().unwrap_or_else(|| {
+            "Thought: no more scripted turns\nFinal Answer: (scripted LLM exhausted)\n".into()
+        });
 
-        eprintln!("--- prompt (truncated) ---\n{}...\n--- model (scripted) ---\n{}", 
-            prompt.chars().take(400).collect::<String>(),
-            out
+        eprintln!(
+            "[scripted LLM] 第 {} 轮（prompt 前 320 字符预览）\n{}\n",
+            idx + 1,
+            prompt.chars().take(320).collect::<String>()
         );
         Ok(out)
     }
@@ -76,15 +91,13 @@ struct Cli {
     workspace: Option<PathBuf>,
     run_id: Option<String>,
     profile: Option<ToolProfile>,
+    /// 非空时表示「单轮 CLI 任务」，否则进入交互会话。
     task: String,
 }
 
 fn parse_cli() -> Result<Cli, String> {
     let mut args = std::env::args().skip(1).peekable();
-    let mut cli = Cli {
-        task: "Use the echo tool on the phrase 'ReAct OK', then summarize.".to_string(),
-        ..Default::default()
-    };
+    let mut cli = Cli::default();
 
     while let Some(arg) = args.peek().cloned() {
         match arg.as_str() {
@@ -123,13 +136,24 @@ fn parse_cli() -> Result<Cli, String> {
             }
             "-h" | "--help" => {
                 return Err(
-                    "usage: hippocampus [--print-system-prompt] [--workspace DIR] [--run-id ID] [--profile PROFILE] [TASK]\n\
+                    "用法: hippocampus [选项] [TASK...]\n\
                      \n\
-                     environment:\n\
+                     无 TASK 时进入交互模式：输入任务目标后回车执行，空行退出。\n\
+                     有 TASK 时单轮执行后退出。\n\
+                     \n\
+                     选项:\n\
+                       --print-system-prompt\n\
+                       --workspace DIR\n\
+                       --run-id ID\n\
+                       --profile PROFILE\n\
+                     \n\
+                     环境变量:\n\
                        CODEX_BASE_URL / CODEX_API_KEY / CODEX_MODEL\n\
                        HIPPOCAMPUS_WORKSPACE_ROOT / HIPPOCAMPUS_RUN_ID /\n\
                        HIPPOCAMPUS_TOOL_PROFILE / HIPPOCAMPUS_TOOL_ALLOWLIST /\n\
-                       HIPPOCAMPUS_CAPABILITY_* / HIPPOCAMPUS_LSP_COMMAND"
+                       HIPPOCAMPUS_CAPABILITY_* / HIPPOCAMPUS_LSP_COMMAND\n\
+                     \n\
+                     说明: 思考过程（Thought/Action/Observation）打印到 stderr；最终答案打印到 stdout。"
                         .into(),
                 );
             }
@@ -145,6 +169,50 @@ fn parse_cli() -> Result<Cli, String> {
     Ok(cli)
 }
 
+async fn read_user_task() -> std::io::Result<Option<String>> {
+    tokio::task::spawn_blocking(|| {
+        print!("任务> ");
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        let n = std::io::stdin().lock().read_line(&mut line)?;
+        if n == 0 {
+            return Ok(None);
+        }
+        let t = line.trim().to_string();
+        if t.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(t))
+        }
+    })
+    .await
+    .unwrap_or_else(|e| std::io::Result::Err(std::io::Error::new(std::io::ErrorKind::Other, e)))
+}
+
+fn scripted_demo_lines() -> [&'static str; 2] {
+    [
+        "Thought: I should list the workspace root to ground my answer in real directory entries.\nAction: list_dir\nAction Input: {\"path\":\".\",\"limit\":32}\n",
+        "Thought: The listing observation is enough for a minimal scripted demo.\nFinal Answer: Scripted path completed: workspace root was listed via list_dir; configure CODEX_* for a real model.\n",
+    ]
+}
+
+enum LlmKind {
+    OpenAi(OpenAiCompatibleProvider),
+    Scripted(ScriptedProvider),
+}
+
+async fn run_react(
+    llm: &LlmKind,
+    loop_: &ReactLoop,
+    ctx: &PromptContext,
+    task: &str,
+) -> Result<String, ReactError> {
+    match llm {
+        LlmKind::OpenAi(p) => loop_.run(p, ctx, task).await,
+        LlmKind::Scripted(p) => loop_.run(p, ctx, task).await,
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let _ = dotenvy::dotenv();
@@ -157,12 +225,10 @@ async fn main() {
         }
     };
 
-    let system = "You are a helpful assistant. Follow the output format in the prompt exactly.";
-
     let mut prompt_ctx = match PromptContext::from_env() {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("Failed to build PromptContext from env: {e:#}");
+            eprintln!("无法从环境构造 PromptContext: {e:#}");
             std::process::exit(1);
         }
     };
@@ -174,7 +240,7 @@ async fn main() {
     }
     if let Some(profile) = cli.profile {
         if let Err(e) = prompt_ctx.set_tool_profile(profile) {
-            eprintln!("Invalid tool profile / allowlist: {e:#}");
+            eprintln!("工具 profile / 白名单无效: {e:#}");
             std::process::exit(1);
         }
     }
@@ -182,19 +248,25 @@ async fn main() {
     let tools = match assemble_tools(&prompt_ctx) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("Failed to assemble tools: {e:#}");
+            eprintln!("装配工具失败: {e:#}");
             std::process::exit(1);
         }
     };
 
-    let loop_ = ReactLoop::new(
-        system,
-        tools,
-        ReactConfig { max_steps: 6 },
-    );
+    let react_cfg = ReactConfig {
+        max_steps: 32,
+        trace_thinking: true,
+    };
+    let loop_ = ReactLoop::new(AGENT_SYSTEM, tools, react_cfg);
+
+    let preview_task = if cli.task.trim().is_empty() {
+        "（在此输入你的任务；CLI 预览占位）"
+    } else {
+        cli.task.trim()
+    };
 
     if cli.print_system_prompt {
-        println!("{}", loop_.render_prompt(&prompt_ctx, &cli.task, ""));
+        println!("{}", loop_.render_prompt(&prompt_ctx, preview_task, ""));
         return;
     }
 
@@ -202,21 +274,48 @@ async fn main() {
     let api_key = std::env::var("CODEX_API_KEY").ok();
     let model = std::env::var("CODEX_MODEL").ok();
 
-    if let (Some(base_url), Some(api_key), Some(model)) = (base_url, api_key, model) {
-        let llm = OpenAiCompatibleProvider::new(base_url, api_key, model);
-        match loop_.run(&llm, &prompt_ctx, &cli.task).await {
-            Ok(answer) => println!("\nFinal: {answer}"),
-            Err(e) => eprintln!("Error: {e}"),
-        }
+    let llm = if let (Some(base_url), Some(api_key), Some(model)) = (base_url, api_key, model) {
+        eprintln!("使用 OpenAI-compatible：model={model}\n");
+        LlmKind::OpenAi(OpenAiCompatibleProvider::new(base_url, api_key, model))
     } else {
-        eprintln!("CODEX_BASE_URL/CODEX_API_KEY/CODEX_MODEL not set; using scripted LLM.\n");
-        let llm = ScriptedProvider::new([
-            "Thought: User wants echoed text; I will call echo.\nAction: echo\nAction Input: \"ReAct OK\"\n",
-            "Thought: Observation confirms success.\nFinal Answer: The echo tool returned the text; ReAct loop works.\n",
-        ]);
-        match loop_.run(&llm, &prompt_ctx, &cli.task).await {
-            Ok(answer) => println!("\nFinal: {answer}"),
-            Err(e) => eprintln!("Error: {e}"),
+        eprintln!("未设置 CODEX_BASE_URL / CODEX_API_KEY / CODEX_MODEL，使用脚本化 LLM（list_dir 演示）。\n");
+        LlmKind::Scripted(ScriptedProvider::new(scripted_demo_lines()))
+    };
+
+    let print_run_outcome = |res: Result<String, ReactError>| {
+        match res {
+            Ok(answer) => {
+                println!("\n── 最终答案 ──\n{answer}\n");
+            }
+            Err(e) => {
+                eprintln!("执行失败: {e}");
+            }
         }
+    };
+
+    if !cli.task.trim().is_empty() {
+        print_run_outcome(run_react(&llm, &loop_, &prompt_ctx, cli.task.trim()).await);
+        return;
     }
+
+    eprintln!(
+        "Hippocampus 交互会话。工作区: {}\n输入任务目标后回车执行；空行退出。\n",
+        prompt_ctx.workspace_root.display()
+    );
+
+    while let Some(task) = match read_user_task().await {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("读取输入失败: {e}");
+            None
+        }
+    } {
+        if let LlmKind::Scripted(p) = &llm {
+            p.rewind().await;
+        }
+        let res = run_react(&llm, &loop_, &prompt_ctx, &task).await;
+        print_run_outcome(res);
+    }
+
+    eprintln!("再见。");
 }

@@ -4,6 +4,26 @@ use crate::tools::{ToolCall, ToolCallId};
 
 static CALL_ID_SEQ: AtomicU64 = AtomicU64::new(1);
 
+/// 取出模型本轮输出里的 `Thought:` 段落（直到 `Action:` / `Final Answer:` 之前）。
+pub fn parse_thought(text: &str) -> Option<String> {
+    let key = "Thought:";
+    let start = text.find(key)? + key.len();
+    let tail = text.get(start..)?;
+    let tail = tail.trim_start();
+    let cut = tail
+        .find("\nAction:")
+        .or_else(|| tail.find("\r\nAction:"))
+        .or_else(|| tail.find("\nFinal Answer:"))
+        .or_else(|| tail.find("\r\nFinal Answer:"))
+        .unwrap_or(tail.len());
+    let s = tail.get(..cut)?.trim();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
+}
+
 pub fn parse_final_answer(text: &str) -> Option<&str> {
     for line in text.lines() {
         let line = line.trim();
