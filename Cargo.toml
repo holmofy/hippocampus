@@ -12,6 +12,7 @@ name = "hippocampus"
 path = "src/main.rs"
 
 [dependencies]
+dotenvy = "0.15"
 anyhow = "1"
 async-trait = "0.1"
 globset = "0.4"

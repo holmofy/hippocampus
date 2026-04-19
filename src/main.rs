@@ -1,6 +1,7 @@
 //! 演示：
 //! - 默认用 OpenAI-compatible provider（OpenAI / OpenRouter / 自建兼容网关）
 //! - 若未配置环境变量，则 fallback 到「脚本 LLM」跑通循环
+//! - 启动时从**当前工作目录**读取 `.env` 并注入进程环境（文件不存在则忽略；**不覆盖**已在 shell 里设置的同名变量）
 //!
 //! 环境变量（OpenAI-compatible）：
 //! - CODEX_BASE_URL: 例如 "https://api.openai.com"
@@ -146,6 +147,8 @@ fn parse_cli() -> Result<Cli, String> {
 
 #[tokio::main]
 async fn main() {
+    let _ = dotenvy::dotenv();
+
     let cli = match parse_cli() {
         Ok(v) => v,
         Err(e) => {
