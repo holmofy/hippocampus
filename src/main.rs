@@ -10,14 +10,19 @@
 //! 额外环境变量（harness / workspace 注入）：
 //! - HIPPOCAMPUS_RUN_ID
 //! - HIPPOCAMPUS_WORKSPACE_ROOT
-//! - HIPPOCAMPUS_CAPABILITY_NETWORK / HIPPOCAMPUS_CAPABILITY_SHELL / HIPPOCAMPUS_CAPABILITY_WRITE_FILE：`1/true/yes/on`
+//! - HIPPOCAMPUS_TOOL_PROFILE：`coding` / `office` / `full` / `minimal` / `custom`（默认 `coding`）
+//! - HIPPOCAMPUS_TOOL_ALLOWLIST：`custom` 时必填，逗号分隔（如 `echo,net_echo`）
+//! - HIPPOCAMPUS_CAPABILITY_NETWORK / HIPPOCAMPUS_CAPABILITY_SHELL / HIPPOCAMPUS_CAPABILITY_WRITE_FILE / HIPPOCAMPUS_CAPABILITY_LSP：`1/true/yes/on`
+//! - HIPPOCAMPUS_LSP_COMMAND：LSP 可执行文件（默认 `rust-analyzer`）
 //!
 //! CLI：
 //! - `--print-system-prompt`：打印第一轮完整 prompt（不调用模型）
 //! - `--workspace <path>` / `--run-id <id>`：覆盖对应字段
+//! - `--profile <coding|office|full|minimal|custom>`：覆盖 `HIPPOCAMPUS_TOOL_PROFILE`（`custom` 仍需环境变量 `HIPPOCAMPUS_TOOL_ALLOWLIST`）
 
 use hippocampus::{
-    EchoTool, LlmProvider, OpenAiCompatibleProvider, PromptContext, ReactConfig, ReactLoop,
+    assemble_tools, LlmProvider, OpenAiCompatibleProvider, PromptContext, ReactConfig, ReactLoop,
+    ToolProfile,
 };
 use std::path::PathBuf;
 
@@ -69,6 +74,7 @@ struct Cli {
     print_system_prompt: bool,
     workspace: Option<PathBuf>,
     run_id: Option<String>,
+    profile: Option<ToolProfile>,
     task: String,
 }
 
@@ -105,13 +111,24 @@ fn parse_cli() -> Result<Cli, String> {
                 }
                 cli.run_id = Some(v);
             }
+            "--profile" => {
+                let _ = args.next();
+                let Some(v) = args.next() else {
+                    return Err("--profile requires a value (coding|office|full|minimal|custom)".into());
+                };
+                cli.profile = Some(
+                    ToolProfile::parse(&v).map_err(|e| format!("--profile: {e}"))?,
+                );
+            }
             "-h" | "--help" => {
                 return Err(
-                    "usage: hippocampus [--print-system-prompt] [--workspace DIR] [--run-id ID] [TASK]\n\
+                    "usage: hippocampus [--print-system-prompt] [--workspace DIR] [--run-id ID] [--profile PROFILE] [TASK]\n\
                      \n\
                      environment:\n\
                        CODEX_BASE_URL / CODEX_API_KEY / CODEX_MODEL\n\
-                       HIPPOCAMPUS_WORKSPACE_ROOT / HIPPOCAMPUS_RUN_ID / HIPPOCAMPUS_CAPABILITY_*"
+                       HIPPOCAMPUS_WORKSPACE_ROOT / HIPPOCAMPUS_RUN_ID /\n\
+                       HIPPOCAMPUS_TOOL_PROFILE / HIPPOCAMPUS_TOOL_ALLOWLIST /\n\
+                       HIPPOCAMPUS_CAPABILITY_* / HIPPOCAMPUS_LSP_COMMAND"
                         .into(),
                 );
             }
@@ -139,14 +156,6 @@ async fn main() {
 
     let system = "You are a helpful assistant. Follow the output format in the prompt exactly.";
 
-    let tools: Vec<Box<dyn hippocampus::Tool>> = vec![Box::new(EchoTool)];
-
-    let loop_ = ReactLoop::new(
-        system,
-        tools,
-        ReactConfig { max_steps: 6 },
-    );
-
     let mut prompt_ctx = match PromptContext::from_env() {
         Ok(v) => v,
         Err(e) => {
@@ -160,6 +169,26 @@ async fn main() {
     if let Some(run_id) = cli.run_id.clone() {
         prompt_ctx.run_id = Some(run_id);
     }
+    if let Some(profile) = cli.profile {
+        if let Err(e) = prompt_ctx.set_tool_profile(profile) {
+            eprintln!("Invalid tool profile / allowlist: {e:#}");
+            std::process::exit(1);
+        }
+    }
+
+    let tools = match assemble_tools(&prompt_ctx) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Failed to assemble tools: {e:#}");
+            std::process::exit(1);
+        }
+    };
+
+    let loop_ = ReactLoop::new(
+        system,
+        tools,
+        ReactConfig { max_steps: 6 },
+    );
 
     if cli.print_system_prompt {
         println!("{}", loop_.render_prompt(&prompt_ctx, &cli.task, ""));
@@ -179,7 +208,7 @@ async fn main() {
     } else {
         eprintln!("CODEX_BASE_URL/CODEX_API_KEY/CODEX_MODEL not set; using scripted LLM.\n");
         let llm = ScriptedProvider::new([
-            "Thought: User wants echoed text; I will call echo.\nAction: echo\nAction Input: ReAct OK\n",
+            "Thought: User wants echoed text; I will call echo.\nAction: echo\nAction Input: \"ReAct OK\"\n",
             "Thought: Observation confirms success.\nFinal Answer: The echo tool returned the text; ReAct loop works.\n",
         ]);
         match loop_.run(&llm, &prompt_ctx, &cli.task).await {
